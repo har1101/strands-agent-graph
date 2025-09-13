@@ -3,7 +3,7 @@ from strands.tools.mcp import MCPClient
 from strands.multiagent import GraphBuilder
 from strands.multiagent.graph import GraphState
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 import logging
 import json
 from boto3.session import Session
@@ -22,8 +22,81 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-boto_session = Session()
-region = boto_session.region_name
+_boto_session = Session()
+region = _boto_session.region_name
+
+
+# ===== ユーティリティ関数（再利用可能・テスト容易化） =====
+def _get_tool_name(tool: Any) -> str:
+    """ツール名を頑健に抽出する。"""
+    return getattr(tool, "tool_name", getattr(tool, "name", str(tool)))
+
+
+def _filter_tools_by_keyword(tools: list, keyword: str) -> list:
+    """指定キーワードを含むツールのみを抽出する。"""
+    key = keyword.lower()
+    return [t for t in tools if key in _get_tool_name(t).lower()]
+
+
+def extract_message_content(agent_result: Any) -> tuple[str, list]:
+    """AgentResultからメッセージコンテンツを抽出（テキスト/JSON）。"""
+    try:
+        message = getattr(agent_result, "message", {}) or {}
+        content = message.get("content", [])
+        texts: list[str] = []
+        jsons: list = []
+
+        for block in content:
+            if isinstance(block, dict):
+                if "text" in block:
+                    texts.append(block["text"])
+                if "json" in block:
+                    jsons.append(block["json"])
+                # toolResultの中も再帰的に処理
+                if "toolResult" in block:
+                    for inner in block.get("toolResult", {}).get("content", []):
+                        if isinstance(inner, dict):
+                            if "text" in inner:
+                                texts.append(inner["text"])
+                            if "json" in inner:
+                                jsons.append(inner["json"])
+
+        return "\n".join(texts).strip(), jsons
+    except Exception as e:
+        logger.error(f"メッセージ抽出エラー: {e}")
+        return "", []
+
+
+def detect_mcp_usage(text: str) -> bool:
+    """MCPツールが使用されたかを簡易検出。"""
+    mcp_indicators = ["slack_", "tavily_", "extract", "search"]
+    return any(indicator in text.lower() for indicator in mcp_indicators)
+
+
+def parse_prompt_from_payload(payload: Dict[str, Any]) -> str:
+    """AgentCore Runtime互換のペイロードからプロンプトを抽出する。"""
+    if not payload:
+        return ""
+    # 入れ子構造（input フィールド）に対応
+    if "input" in payload:
+        input_data = payload["input"]
+        if isinstance(input_data, dict):
+            return input_data.get("prompt", "")
+        if isinstance(input_data, str):
+            try:
+                return json.loads(input_data).get("prompt", "")
+            except Exception:
+                return input_data
+    # 直接 prompt があるケース
+    if "prompt" in payload:
+        return str(payload["prompt"])  # 念のため文字列化
+    return ""
+
+
+def always_false_condition(_: GraphState) -> bool:
+    """常にFalseを返す条件（終了ポイントとして機能）。"""
+    logger.info("🔚 終了条件を評価 - 常にFalseを返してグラフを終了")
+    return False
 
 class ResearchAgent:
     """
@@ -100,15 +173,15 @@ class ResearchAgent:
         # デコレータ付き関数を呼び出してトークンを取得
         return await _get_token()
     
-    async def create_mcp_client_and_tools(self) -> tuple[MCPClient, list]:
+    async def create_mcp_client_and_tools(self) -> MCPClient:
         """
-        トークン取得 → MCPクライアントとツールのリストを返す。
-        
+        トークン取得 → MCPクライアントを返す。
+
         MCPクライアントはwithコンテキスト内で使用する必要があるため、
-        クライアントインスタンスとツールのリストを返します。
+        認証済みのクライアントインスタンスを返します。
 
         Returns:
-            tuple[MCPClient, list]: MCPクライアントインスタンスと利用可能なツールのリスト
+            MCPClient: 認証済みMCPクライアントインスタンス
         """
 
         # ステップ1: AgentCore Identityを使用してアクセストークンを取得
@@ -141,7 +214,7 @@ class ResearchAgent:
         
         return mcp_client
     
-    def get_full_tools_list(self, client):
+    def get_full_tools_list(self, client: MCPClient) -> list:
         """
         ページネーションをサポートしてすべての利用可能なツールをリスト。
         
@@ -154,20 +227,119 @@ class ResearchAgent:
         Returns:
             list: 利用可能なツールの完全なリスト
         """
-        more_tools = True
-        tools = []
+        tools: list = []
         pagination_token = None
-        
-        while more_tools:
+
+        while True:
             tmp_tools = client.list_tools_sync(pagination_token=pagination_token)
             tools.extend(tmp_tools)
-            
-            if tmp_tools.pagination_token is None:
-                more_tools = False
-            else:
-                more_tools = True 
-                pagination_token = tmp_tools.pagination_token
+            if getattr(tmp_tools, "pagination_token", None) is None:
+                break
+            pagination_token = tmp_tools.pagination_token
+
         return tools
+
+# ==== Slack Agent Factory ======================================================
+class SlackAgentFactory(ResearchAgent):
+    """
+    Slack向けAgentのビルダー。
+    - MCPセッションの 'with mcp_client:' は呼び出し側で保持する（重要）
+    - build(...) は *必ず with の中* で呼ぶこと（ツール列挙もその場のセッションで実施）
+    """
+
+    def __init__(self, model_id: str | None = None, system_prompt: str | None = None):
+        super().__init__()
+        self.model_id = model_id or os.environ.get(
+            "MODEL_ID",
+            "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        )
+        self.system_prompt = system_prompt or (
+            "あなたはSlack統合アシスタントです。"
+            "指定チャンネルからURLが添付されているメッセージを取得し、"
+            "JSONで {urls:[...], evidence:[...]} を返してください。"
+        )
+
+    def build(self, mcp_client: MCPClient) -> Agent:
+        """
+        with mcp_client: の内側で呼び出すこと。
+        MCPツールを列挙し、Slack系のみを選り分けて Agent を生成して返す。
+        """
+        # 1) 現在のセッションでツール列挙（← これが with の内側必須）
+        tools = self.get_full_tools_list(mcp_client)
+
+        # 2) Slack系ツールに絞る（無ければ全部使う）
+        slack_tools = _filter_tools_by_keyword(tools, "slack")
+        if not slack_tools:
+            logger.warning("Slack系ツールが見つからないため、全ツールを使用します。")
+            slack_tools = tools
+
+        # 3) Agent生成
+        agent = Agent(
+            name="SlackAgent",
+            tools=slack_tools,
+            model=self.model_id,
+            system_prompt=self.system_prompt,
+        )
+
+        # ログ（任意）
+        try:
+            tool_names = [_get_tool_name(t) for t in slack_tools]
+        except Exception:
+            tool_names = [str(t) for t in slack_tools]
+        logger.info(f"SlackAgent 構築: ツール数={len(slack_tools)} -> {tool_names}")
+
+        return agent
+
+class TavilyAgentFactory(ResearchAgent):
+    """
+    Tavily向けAgentのビルダー。
+    - 呼び出し側で with mcp_client: を保持すること（重要）
+    - build(...) は必ず with の中で呼ぶ
+    """
+
+    def __init__(self, model_id: str | None = None, system_prompt: str | None = None):
+        super().__init__()
+        self.model_id = model_id or os.environ.get(
+            "MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        )
+        self.system_prompt = system_prompt or (
+            "あなたはWeb要約エージェントです。与えられたURLの本文を抽出・要約し、"
+            "JSON {summaries:[{url, bullets:[...]}]} を返してください。"
+        )
+
+    def build(self, mcp_client: MCPClient) -> Agent:
+        # 1) 現在のセッションでツール列挙（← with の内側必須）
+        tools = self.get_full_tools_list(mcp_client)
+
+        # 2) Tavily系ツールに絞る（無ければ全部使う）
+        #    必要に応じて "extract" や "crawler" なども含めてOK
+        tavily_tools = _filter_tools_by_keyword(tools, "tavily")
+        if not tavily_tools:
+            tavily_tools = _filter_tools_by_keyword(tools, "extract")
+        if not tavily_tools:
+            logger.warning("Tavily系ツールが見つからないため、全ツールを使用します。")
+            tavily_tools = tools
+
+        # 3) Agent 生成
+        agent = Agent(
+            name="TavilyAgent",
+            tools=tavily_tools,
+            model=self.model_id,
+            system_prompt=self.system_prompt,
+        )
+        try:
+            names = [_get_tool_name(t) for t in tavily_tools]
+        except Exception:
+            names = [str(t) for t in tavily_tools]
+        logger.info(f"TavilyAgent 構築: ツール数={len(tavily_tools)} -> {names}")
+        return agent
+
+    async def stream(self, agent: Agent, prompt: str):
+        """with mcp_client: の内側で呼ぶこと。"""
+        async for ev in agent.stream_async(prompt):
+            if ev is not None:
+                yield ev
+
 
 # AgentCoreアプリケーションを初期化
 app = BedrockAgentCoreApp()
@@ -199,23 +371,7 @@ async def invoke_agent_graph(payload: Dict[str, Any]):
         return
     
     # プロンプトの検証とペイロード構造の処理
-    user_message = ""
-    
-    # ペイロードが入れ子構造の場合（AgentCore Runtime経由）
-    if payload and "input" in payload:
-        input_data = payload["input"]
-        if isinstance(input_data, dict):
-            user_message = input_data.get("prompt", "")
-        elif isinstance(input_data, str):
-            # inputが文字列の場合はJSONとして解析
-            try:
-                input_json = json.loads(input_data)
-                user_message = input_json.get("prompt", "")
-            except:
-                user_message = input_data
-    # 直接promptが含まれる場合
-    elif payload and "prompt" in payload:
-        user_message = payload["prompt"]
+    user_message = parse_prompt_from_payload(payload)
     
     if not user_message:
         logger.error(f"無効なペイロード構造: {payload}")
@@ -243,75 +399,16 @@ async def invoke_agent_graph(payload: Dict[str, Any]):
         with mcp_client:
             logger.info("✅ MCPコンテキストに入りました - セッションアクティブ")
             
-            # ステップ3: 認証された接続を通じて利用可能なツールをリスト
-            logger.info("ステップ3: 認証されたMCPクライアント経由で利用可能なツールをリスト中...")
-            tools = agent_with_identity.get_full_tools_list(mcp_client)
+            slack_agent = SlackAgentFactory(
+                model_id=os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+                system_prompt=slack_agent_system_prompt,
+            ).build(mcp_client)
             
-            # MCPツールの属性名を確認してからログ出力
-            try:
-                tools_names = [getattr(tool, 'tool_name', getattr(tool, 'name', str(tool))) for tool in tools]
-            except Exception as e:
-                logger.warning(f"ツール名の取得に失敗: {e}")
-                tools_names = [str(tool) for tool in tools]
-            logger.info(f"利用可能なツール: {tools_names}")
-            logger.info(f"📊 取得したツール数: {len(tools)}")
-
-            if not tools:
-                raise RuntimeError("Gatewayから利用可能なツールがありません")
+            tavily_agent = TavilyAgentFactory(
+                model_id=os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
+                system_prompt=tavily_agent_system_prompt,
+            ).build(mcp_client)
             
-            # ツールをフィルタリング
-            # SlackAgent用: ツール名に「slack」が含まれるツールのみ
-            slack_tools = []
-            for tool in tools:
-                tool_name = getattr(tool, 'tool_name', getattr(tool, 'name', str(tool)))
-                if 'slack' in tool_name.lower():
-                    slack_tools.append(tool)
-            
-            # TavilyAgent用: ツール名に「tavily」が含まれるツールのみ
-            tavily_tools = []
-            for tool in tools:
-                tool_name = getattr(tool, 'tool_name', getattr(tool, 'name', str(tool)))
-                if 'tavily' in tool_name.lower():
-                    tavily_tools.append(tool)
-            
-            # フィルタリング結果をログ出力
-            try:
-                slack_tools_names = [getattr(tool, 'tool_name', getattr(tool, 'name', str(tool))) for tool in slack_tools]
-                tavily_tools_names = [getattr(tool, 'tool_name', getattr(tool, 'name', str(tool))) for tool in tavily_tools]
-            except Exception as e:
-                logger.warning(f"フィルタ済みツール名の取得に失敗: {e}")
-                slack_tools_names = [str(tool) for tool in slack_tools]
-                tavily_tools_names = [str(tool) for tool in tavily_tools]
-            
-            logger.info(f"📊 SlackAgent用ツール ({len(slack_tools)}個): {slack_tools_names}")
-            logger.info(f"📊 TavilyAgent用ツール ({len(tavily_tools)}個): {tavily_tools_names}")
-            
-            # 各エージェントが使用するツールの検証
-            if not slack_tools:
-                logger.warning("⚠️ SlackAgent用のツールが見つかりません。全ツールを使用します。")
-                slack_tools = tools
-            
-            if not tavily_tools:
-                logger.warning("⚠️ TavilyAgent用のツールが見つかりません。全ツールを使用します。")
-                tavily_tools = tools
-            
-            # ステップ4: フィルタリング済みツールでエージェントを作成
-            logger.info(f"ステップ4: Slackツールのみで 'SlackAgent' を作成中...")
-            slack_agent = Agent(
-                tools=slack_tools,  # Slackツールのみを使用
-                model="us.anthropic.claude-sonnet-4-20250514-v1:0",
-                system_prompt=slack_agent_system_prompt
-            )
-            logger.info(f"SlackAgent作成完了（{len(slack_tools)}個のツールを使用）")
-
-            logger.info(f"ステップ5: Tavilyツールのみで 'TavilyAgent' を作成中...")
-            tavily_agent = Agent(
-                tools=tavily_tools,  # Tavilyツールのみを使用
-                model="us.anthropic.claude-sonnet-4-20250514-v1:0",
-                system_prompt=tavily_agent_system_prompt
-            )
-            logger.info(f"TavilyAgent作成完了（{len(tavily_tools)}個のツールを使用）")
-
             block_agent = Agent()
 
             # Graphを作成していく
@@ -321,12 +418,6 @@ async def invoke_agent_graph(payload: Dict[str, Any]):
             builder.add_node(slack_agent, "slack_agent")
             builder.add_node(tavily_agent, "tavily_agent")
             builder.add_node(block_agent, "block_agent")
-
-            # 常にFalseを返す条件関数を定義（終了ポイントとして機能）
-            def always_false_condition(state: GraphState) -> bool:
-                """常にFalseを返してグラフを終了させる条件"""
-                logger.info("🔚 終了条件を評価 - 常にFalseを返してグラフを終了")
-                return False
 
             # エッジを追加
             builder.add_edge("slack_agent", "tavily_agent")
@@ -352,45 +443,11 @@ async def invoke_agent_graph(payload: Dict[str, Any]):
             try:
                 # 非同期実行でGraphを実行
                 logger.info("🚀 Graph.invoke_async()を開始...")
-                graph_result = await graph.invoke_async(user_message)
+                graph_result = graph(user_message)
                 
                 # 結果の処理（graph_with_tool_response_format.mdに基づく改善版）
                 logger.info("🔍 Graph実行結果を処理中...")
-                import json
                 from strands.multiagent.base import Status
-
-                def extract_message_content(agent_result):
-                    """AgentResultからメッセージコンテンツを抽出"""
-                    try:
-                        message = getattr(agent_result, "message", {}) or {}
-                        content = message.get("content", [])
-                        texts = []
-                        jsons = []
-                        
-                        for block in content:
-                            if isinstance(block, dict):
-                                if "text" in block:
-                                    texts.append(block["text"])
-                                if "json" in block:
-                                    jsons.append(block["json"])
-                                # toolResultの中も再帰的に処理
-                                if "toolResult" in block:
-                                    for inner in block.get("toolResult", {}).get("content", []):
-                                        if isinstance(inner, dict):
-                                            if "text" in inner:
-                                                texts.append(inner["text"])
-                                            if "json" in inner:
-                                                jsons.append(inner["json"])
-                        
-                        return "\n".join(texts).strip(), jsons
-                    except Exception as e:
-                        logger.error(f"メッセージ抽出エラー: {e}")
-                        return "", []
-
-                def detect_mcp_usage(text: str) -> bool:
-                    """MCPツールが使用されたかを検出"""
-                    mcp_indicators = ["slack_", "tavily_", "extract", "search"]
-                    return any(indicator in text.lower() for indicator in mcp_indicators)
 
                 # 構造化されたレスポンスを作成
                 structured_response = {
